@@ -48,7 +48,7 @@ def get_conv_output_size(input_size, kernel_size, stride, padding, dilation):
                 (kernel_size[i] - 1) - 1) // stride[i] + 1
         if size < 0:
             size = 0
-            output_size.append(size)
+        output_size.append(size)
     return output_size
 
 
@@ -89,10 +89,10 @@ def get_indice_pairs(indices: torch.Tensor,
     device = indices.device
     num_points = indices.shape[0]
 
-        if subm:
-            out_inds = indices
+    if subm:
+        out_inds = indices
         num_out = num_points
-        else:
+    else:
         out_inds, num_out = _compute_output_indices(
             indices, batch_size, spatial_shape, ksize, stride,
             padding, dilation, out_padding, transposed)
@@ -114,10 +114,10 @@ def _compute_output_indices(indices, batch_size, spatial_shape, ksize,
     ndim = len(spatial_shape)
     if transposed:
         out_spatial = get_deconv_output_size(spatial_shape, ksize, stride,
-                                               padding, dilation, out_padding)
-        else:
+                                             padding, dilation, out_padding)
+    else:
         out_spatial = get_conv_output_size(spatial_shape, ksize, stride,
-                                             padding, dilation)
+                                           padding, dilation)
 
     # For each input point, compute all possible output positions
     coords = indices[:, 1:].cpu().numpy()  # [N, ndim]
@@ -128,16 +128,11 @@ def _compute_output_indices(indices, batch_size, spatial_shape, ksize,
         for offset in np.ndindex(*ksize):
             if transposed:
                 out_coord = tuple(
-                    (coords[i][d] + padding[d] - offset[d] * dilation[d]) * stride[d] + 
+                    (coords[i][d] + padding[d] - offset[d] * dilation[d]) * stride[d] +
                     offset[d] * dilation[d]
                     for d in range(ndim)
                 )
-    else:
-                out_coord = tuple(
-                    (coords[i][d] * stride[d] - padding[d] + offset[d] * dilation[d]) 
-                    // stride[d]  # simplified
-                    for d in range(ndim)
-                )
+            else:
                 out_coord = tuple(
                     (coords[i][d] + padding[d] - offset[d] * dilation[d]) // stride[d]
                     for d in range(ndim)
@@ -179,7 +174,7 @@ def _build_indice_pairs(indices, out_inds, indice_pairs, indice_pair_num,
     if subm:
         ref_coords = in_coords
         ref_hash = in_hash
-                    else:
+    else:
         ref_coords = out_coords
         ref_hash = out_hash
 
@@ -197,7 +192,7 @@ def _build_indice_pairs(indices, out_inds, indice_pairs, indice_pair_num,
                     int(out_spatial[d] + offset[d] - ksize[d] // 2)
                     for d in range(ndim)
                 )
-        else:
+            else:
                 in_spatial = tuple(
                     int(out_spatial[d] * stride[d] - padding[d] + offset[d] * dilation[d])
                     for d in range(ndim)
@@ -234,7 +229,7 @@ def indice_conv(features: torch.Tensor,
     Returns:
         out_features: [N_out, C_out]
     """
-        kv = filters.shape[0]
+    kv = filters.shape[0]
     c_in = features.shape[1]
     c_out = filters.shape[2]
     device = features.device
@@ -245,7 +240,7 @@ def indice_conv(features: torch.Tensor,
     for i in range(kv):
         n_act = int(indice_pair_num[i].item())
         if n_act == 0:
-                continue
+            continue
 
         inp_inds = indice_pairs[i, 0, :n_act].long()
         out_inds = indice_pairs[i, 1, :n_act].long()
