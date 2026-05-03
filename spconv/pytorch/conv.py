@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter
 from spconv.core import ConvAlgo
 from spconv.pytorch.core import SparseConvTensor, IndiceData, expand_nd
 from spconv.pytorch import ops
+from spconv.pytorch.ops import _gemm
 from spconv.pytorch.modules import SparseModule
 from spconv.constants import ALL_WEIGHT_IS_KRSC
 
@@ -83,7 +84,7 @@ class SparseConvolution(SparseModule):
         batch_size = input.batch_size
 
         if self.conv1x1:
-            out_features = torch.mm(features, self.weight)
+            out_features = _gemm(features, self.weight)
             if self.bias is not None:
                 out_features = out_features + self.bias
             out_tensor = input.replace_feature(out_features)

@@ -7,6 +7,38 @@ from typing import List, Optional, Tuple
 from spconv.core import ConvAlgo
 from spconv.constants import ALL_WEIGHT_IS_KRSC, AllocKeys
 
+# FlyDSL GEMM backend (via cumm-rocm)
+_FLYDSL_TUNER = None
+
+def _get_flydsl_tuner():
+    """Lazy-init FlyDSLGemmTuner (only when FlyDSL is available)."""
+    global _FLYDSL_TUNER
+    if _FLYDSL_TUNER is None:
+        try:
+            from cumm.gemm_tuner import FlyDSLGemmTuner
+            _FLYDSL_TUNER = FlyDSLGemmTuner()
+        except ImportError:
+            _FLYDSL_TUNER = False  # FlyDSL not available, fallback to torch.mm
+    return _FLYDSL_TUNER
+
+
+def _gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """GEMM dispatch: FlyDSL for fp16/bf16, torch.mm for fp32.
+    
+    a: [M, K], b: [K, N] → output: [M, N]
+    """
+    tuner = _get_flydsl_tuner()
+    if tuner and a.dtype in (torch.float16, torch.bfloat16):
+        m, k = a.shape
+        n = b.shape[1]
+        # FlyDSL interface: C = A @ B^T, so B must be [N, K]
+        b_t = b.t().contiguous()  # [K, N] → [N, K]
+        c = torch.zeros(m, n, dtype=a.dtype, device=a.device)
+        tuner.matmul(c, a.contiguous(), b_t)
+        return c
+    else:
+        return torch.mm(a, b)
+
 
 def get_conv_output_size(input_size, kernel_size, stride, padding, dilation):
     ndim = len(input_size)
@@ -16,7 +48,7 @@ def get_conv_output_size(input_size, kernel_size, stride, padding, dilation):
                 (kernel_size[i] - 1) - 1) // stride[i] + 1
         if size < 0:
             size = 0
-        output_size.append(size)
+            output_size.append(size)
     return output_size
 
 
@@ -57,10 +89,10 @@ def get_indice_pairs(indices: torch.Tensor,
     device = indices.device
     num_points = indices.shape[0]
 
-    if subm:
-        out_inds = indices
+        if subm:
+            out_inds = indices
         num_out = num_points
-    else:
+        else:
         out_inds, num_out = _compute_output_indices(
             indices, batch_size, spatial_shape, ksize, stride,
             padding, dilation, out_padding, transposed)
@@ -82,10 +114,10 @@ def _compute_output_indices(indices, batch_size, spatial_shape, ksize,
     ndim = len(spatial_shape)
     if transposed:
         out_spatial = get_deconv_output_size(spatial_shape, ksize, stride,
-                                            padding, dilation, out_padding)
-    else:
+                                               padding, dilation, out_padding)
+        else:
         out_spatial = get_conv_output_size(spatial_shape, ksize, stride,
-                                          padding, dilation)
+                                             padding, dilation)
 
     # For each input point, compute all possible output positions
     coords = indices[:, 1:].cpu().numpy()  # [N, ndim]
@@ -100,7 +132,7 @@ def _compute_output_indices(indices, batch_size, spatial_shape, ksize,
                     offset[d] * dilation[d]
                     for d in range(ndim)
                 )
-            else:
+    else:
                 out_coord = tuple(
                     (coords[i][d] * stride[d] - padding[d] + offset[d] * dilation[d]) 
                     // stride[d]  # simplified
@@ -147,7 +179,7 @@ def _build_indice_pairs(indices, out_inds, indice_pairs, indice_pair_num,
     if subm:
         ref_coords = in_coords
         ref_hash = in_hash
-    else:
+                    else:
         ref_coords = out_coords
         ref_hash = out_hash
 
@@ -165,7 +197,7 @@ def _build_indice_pairs(indices, out_inds, indice_pairs, indice_pair_num,
                     int(out_spatial[d] + offset[d] - ksize[d] // 2)
                     for d in range(ndim)
                 )
-            else:
+        else:
                 in_spatial = tuple(
                     int(out_spatial[d] * stride[d] - padding[d] + offset[d] * dilation[d])
                     for d in range(ndim)
@@ -202,7 +234,7 @@ def indice_conv(features: torch.Tensor,
     Returns:
         out_features: [N_out, C_out]
     """
-    kv = filters.shape[0]
+        kv = filters.shape[0]
     c_in = features.shape[1]
     c_out = filters.shape[2]
     device = features.device
@@ -213,7 +245,7 @@ def indice_conv(features: torch.Tensor,
     for i in range(kv):
         n_act = int(indice_pair_num[i].item())
         if n_act == 0:
-            continue
+                continue
 
         inp_inds = indice_pairs[i, 0, :n_act].long()
         out_inds = indice_pairs[i, 1, :n_act].long()
@@ -223,7 +255,7 @@ def indice_conv(features: torch.Tensor,
 
         # GEMM: [n_act, C_in] @ [C_in, C_out] → [n_act, C_out]
         w = filters[i]  # [C_in, C_out]
-        gemm_out = torch.mm(inp_gathered, w)
+        gemm_out = _gemm(inp_gathered, w)
 
         # scatter-add to output
         out_features.index_add_(0, out_inds, gemm_out)
@@ -271,11 +303,11 @@ def indice_conv_backward(features: torch.Tensor,
         w = filters[i]  # [C_in, C_out]
 
         # dfilters[i] = inp_gathered^T @ out_bp_gathered
-        dfilters[i] = torch.mm(inp_gathered.t(), out_bp_gathered)
+        dfilters[i] = _gemm(inp_gathered.t(), out_bp_gathered)
 
         # din: scatter grad back to input
         # din_gathered = out_bp_gathered @ w^T
-        din_gathered = torch.mm(out_bp_gathered, w.t())
+        din_gathered = _gemm(out_bp_gathered, w.t())
         din.index_add_(0, inp_inds, din_gathered)
 
     return din, dfilters

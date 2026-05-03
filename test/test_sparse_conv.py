@@ -441,3 +441,142 @@ class TestEncoderDecoder:
         assert out.spatial_shape == [8, 8, 8]
         assert out.features.shape[1] == 32
         assert out.features.shape[0] > 0
+
+
+# ============================================================
+# FlyDSL GEMM Path (fp16/bf16)
+# ============================================================
+
+class TestFlyDSLGemm:
+    """Tests that exercise the FlyDSL GEMM path (fp16/bf16 dtypes)."""
+
+    def test_subm_conv_fp16(self, device):
+        """SubM conv in fp16 — triggers FlyDSL hgemm_splitk."""
+        import spconv.pytorch as spconv
+
+        in_ch, out_ch = 16, 32
+        spatial_shape = [8, 8, 8]
+        num_points = 30
+
+        conv = spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=True).to(device).half()
+        x = _make_sparse_input(1, num_points, in_ch, spatial_shape, device, dtype=torch.float16)
+        out = conv(x)
+
+        assert out.features.dtype == torch.float16
+        assert out.features.shape == (num_points, out_ch)
+        assert not torch.isnan(out.features).any()
+
+    def test_subm_conv_bf16(self, device):
+        """SubM conv in bf16 — triggers FlyDSL hgemm_splitk."""
+        import spconv.pytorch as spconv
+
+        in_ch, out_ch = 16, 32
+        spatial_shape = [8, 8, 8]
+        num_points = 30
+
+        conv = spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=True).to(device).bfloat16()
+        x = _make_sparse_input(1, num_points, in_ch, spatial_shape, device, dtype=torch.bfloat16)
+        out = conv(x)
+
+        assert out.features.dtype == torch.bfloat16
+        assert out.features.shape == (num_points, out_ch)
+        assert not torch.isnan(out.features).any()
+
+    def test_sparse_conv_fp16_stride(self, device):
+        """Strided sparse conv in fp16."""
+        import spconv.pytorch as spconv
+
+        in_ch, out_ch = 16, 32
+        spatial_shape = [10, 10, 10]
+        num_points = 40
+
+        conv = spconv.SparseConv3d(in_ch, out_ch, 3, stride=2, padding=1, bias=False).to(device).half()
+        x = _make_sparse_input(1, num_points, in_ch, spatial_shape, device, dtype=torch.float16)
+        out = conv(x)
+
+        assert out.features.dtype == torch.float16
+        assert out.spatial_shape == [5, 5, 5]
+        assert not torch.isnan(out.features).any()
+
+    def test_conv1x1_fp16(self, device):
+        """1x1 conv fp16 — direct _gemm call."""
+        import spconv.pytorch as spconv
+
+        in_ch, out_ch = 32, 64
+        spatial_shape = [8, 8, 8]
+        num_points = 20
+
+        conv = spconv.SparseConv3d(in_ch, out_ch, 1, bias=False).to(device).half()
+        x = _make_sparse_input(1, num_points, in_ch, spatial_shape, device, dtype=torch.float16)
+        out = conv(x)
+
+        assert out.features.shape == (num_points, out_ch)
+        assert out.features.dtype == torch.float16
+
+    def test_fp16_backward(self, device):
+        """Verify gradients flow through fp16 sparse conv (FlyDSL path)."""
+        import spconv.pytorch as spconv
+
+        in_ch, out_ch = 16, 32
+        spatial_shape = [6, 6, 6]
+        num_points = 20
+
+        conv = spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=True).to(device).half()
+        x = _make_sparse_input(1, num_points, in_ch, spatial_shape, device, dtype=torch.float16)
+        x.features.requires_grad_(True)
+
+        out = conv(x)
+        loss = out.features.sum()
+        loss.backward()
+
+        assert x.features.grad is not None
+        assert x.features.grad.dtype == torch.float16
+        assert conv.weight.grad is not None
+
+    def test_amp_training(self, device):
+        """Mixed precision training with torch.cuda.amp.autocast."""
+        import spconv.pytorch as spconv
+
+        if device.type == 'cpu':
+            pytest.skip("AMP requires CUDA/ROCm")
+
+        in_ch, out_ch = 16, 32
+        spatial_shape = [8, 8, 8]
+        num_points = 25
+
+        model = spconv.SparseSequential(
+            spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=False),
+            spconv.SparseBatchNorm(out_ch),
+            spconv.SparseReLU(),
+        ).to(device)
+
+        x = _make_sparse_input(1, num_points, in_ch, spatial_shape, device)
+
+        with torch.amp.autocast('cuda', dtype=torch.float16):
+            out = model(x)
+
+        assert out.features.shape == (num_points, out_ch)
+
+    def test_sequential_fp16_inference(self, device):
+        """Full pipeline in fp16 inference mode."""
+        import spconv.pytorch as spconv
+
+        model = spconv.SparseSequential(
+            spconv.SubMConv3d(8, 16, 3, padding=1, bias=False),
+            spconv.SparseBatchNorm(16),
+            spconv.SparseReLU(),
+            spconv.SparseConv3d(16, 32, 3, stride=2, padding=1, bias=False),
+            spconv.SparseBatchNorm(32),
+            spconv.SparseReLU(),
+        ).to(device).half()
+        model.eval()
+
+        x = _make_sparse_input(1, 40, 8, [12, 12, 12], device, dtype=torch.float16)
+
+        with torch.no_grad():
+            out = model(x)
+
+        assert out.features.dtype == torch.float16
+        assert out.spatial_shape == [6, 6, 6]
+        assert out.features.shape[1] == 32
+        assert not torch.isnan(out.features).any()
