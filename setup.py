@@ -25,7 +25,6 @@ setup(
     install_requires=[
         "torch",
         "numpy",
-        "cumm-rocm",
     ],
     extras_require={
         "flydsl": ["flydsl"],

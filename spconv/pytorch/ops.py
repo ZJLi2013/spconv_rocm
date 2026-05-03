@@ -6,6 +6,7 @@ import numpy as np
 from typing import List, Optional, Tuple
 from spconv.core import ConvAlgo
 from spconv.constants import ALL_WEIGHT_IS_KRSC, AllocKeys
+import functools
 
 # FlyDSL GEMM backend (via cumm-rocm)
 _FLYDSL_TUNER = None
@@ -63,6 +64,289 @@ def get_deconv_output_size(input_size, kernel_size, stride, padding, dilation,
     return output_size
 
 
+###############################################################################
+# GPU indice pairs via PyTorch native ops (sort + searchsorted)
+# Mirrors original CUDA algorithm without custom kernels.
+###############################################################################
+
+def _coord_to_key(coords: torch.Tensor, spatial_shape: List[int],
+                  batch_size: int) -> torch.Tensor:
+    """Encode (batch, z, y, x, ...) into a single int64 scalar key.
+
+    Mimics the original LinearLayout / LayoutNPQ:
+        key = batch * prod(spatial_shape) + z * (Y*X) + y * X + x
+
+    Args:
+        coords: [N, ndim+1] int tensor (batch, spatial_dims...)
+        spatial_shape: [ndim] spatial extents
+    Returns:
+        keys: [N] int64 tensor
+    """
+    ndim = len(spatial_shape)
+    strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        strides[d] = strides[d + 1] * spatial_shape[d + 1]
+    vol = strides[0] * spatial_shape[0]
+
+    keys = coords[:, 0].to(torch.int64) * vol
+    for d in range(ndim):
+        keys = keys + coords[:, d + 1].to(torch.int64) * strides[d]
+    return keys
+
+
+def _build_hash_table(keys: torch.Tensor):
+    """Build a sort-based lookup table from keys.
+
+    Returns:
+        sorted_keys: sorted unique keys
+        sorted_vals: original indices corresponding to sorted_keys
+    """
+    sorted_keys, sorted_indices = torch.sort(keys)
+    return sorted_keys, sorted_indices
+
+
+def _hash_lookup(sorted_keys: torch.Tensor, sorted_vals: torch.Tensor,
+                 query_keys: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Lookup query_keys in a sorted hash table.
+
+    Returns:
+        found_vals: values for found keys (index into original array), -1 if not found
+        found_mask: bool tensor, True where key was found
+    """
+    pos = torch.searchsorted(sorted_keys, query_keys)
+    pos = pos.clamp(max=sorted_keys.shape[0] - 1)
+    found_mask = sorted_keys[pos] == query_keys
+    found_vals = torch.where(found_mask, sorted_vals[pos],
+                             torch.tensor(-1, dtype=sorted_vals.dtype,
+                                          device=sorted_vals.device))
+    return found_vals, found_mask
+
+
+def _get_kernel_offsets(ksize: List[int]) -> torch.Tensor:
+    """Generate kernel offset tuples as a tensor.
+
+    Returns: [kv, ndim] int tensor with all kernel offsets.
+    """
+    ranges = [torch.arange(k) for k in ksize]
+    grids = torch.meshgrid(*ranges, indexing='ij')
+    return torch.stack([g.reshape(-1) for g in grids], dim=1)  # [kv, ndim]
+
+
+def _get_indice_pairs_gpu(indices: torch.Tensor,
+                          batch_size: int,
+                          spatial_shape: List[int],
+                          ksize: List[int],
+                          stride: List[int],
+                          padding: List[int],
+                          dilation: List[int],
+                          out_padding: List[int],
+                          subm: bool,
+                          transposed: bool):
+    """GPU implementation of indice pairs using sort + searchsorted.
+
+    Mirrors the original two-stage CUDA algorithm but uses only PyTorch ops.
+    """
+    ndim = len(spatial_shape)
+    kv = int(np.prod(ksize))
+    device = indices.device
+    N = indices.shape[0]
+
+    offsets = _get_kernel_offsets(ksize).to(device)  # [kv, ndim]
+
+    if subm:
+        return _get_indice_pairs_subm_gpu(
+            indices, batch_size, spatial_shape, ksize, dilation,
+            offsets, device)
+    else:
+        return _get_indice_pairs_conv_gpu(
+            indices, batch_size, spatial_shape, ksize, stride,
+            padding, dilation, out_padding, offsets, transposed, device)
+
+
+def _get_indice_pairs_subm_gpu(indices, batch_size, spatial_shape, ksize,
+                                dilation, offsets, device):
+    """SubM conv: input == output, build hash on input, query neighbors."""
+    ndim = len(spatial_shape)
+    kv = offsets.shape[0]
+    N = indices.shape[0]
+
+    in_keys = _coord_to_key(indices, spatial_shape, batch_size)
+    sorted_keys, sorted_vals = _build_hash_table(in_keys)
+
+    center = kv // 2
+    half_ksize = torch.tensor([k // 2 for k in ksize], device=device)
+
+    indice_pairs = torch.full((kv, 2, N), -1, dtype=torch.int32, device=device)
+    indice_pair_num = torch.zeros(kv, dtype=torch.int32, device=device)
+
+    # Center kernel position: identity mapping
+    arange_n = torch.arange(N, dtype=torch.int32, device=device)
+    indice_pairs[center, 0, :N] = arange_n
+    indice_pairs[center, 1, :N] = arange_n
+    indice_pair_num[center] = N
+
+    in_spatial = indices[:, 1:]  # [N, ndim]
+
+    for kid in range(kv):
+        if kid == center:
+            continue
+        offset = offsets[kid]  # [ndim]
+        neighbor_spatial = in_spatial + (offset - half_ksize) * torch.tensor(
+            dilation, device=device)
+
+        valid_bounds = (neighbor_spatial >= 0).all(dim=1)
+        for d in range(ndim):
+            valid_bounds = valid_bounds & (neighbor_spatial[:, d] < spatial_shape[d])
+
+        if not valid_bounds.any():
+            continue
+
+        valid_idx = valid_bounds.nonzero(as_tuple=True)[0]
+        neighbor_coords = torch.cat([
+            indices[valid_idx, 0:1],
+            neighbor_spatial[valid_idx]
+        ], dim=1)
+
+        query_keys = _coord_to_key(neighbor_coords, spatial_shape, batch_size)
+        found_vals, found_mask = _hash_lookup(sorted_keys, sorted_vals, query_keys)
+
+        actual_found = found_mask.nonzero(as_tuple=True)[0]
+        n_found = actual_found.shape[0]
+        if n_found == 0:
+            continue
+
+        out_indices = valid_idx[actual_found]  # output point indices
+        in_indices = found_vals[actual_found]  # input point indices
+
+        indice_pairs[kid, 0, :n_found] = in_indices.int()
+        indice_pairs[kid, 1, :n_found] = out_indices.int()
+        indice_pair_num[kid] = n_found
+
+        # Exploit symmetry: mirror kernel position
+        mirror_kid = kv - 1 - kid
+        if mirror_kid != kid and mirror_kid != center:
+            indice_pairs[mirror_kid, 0, :n_found] = out_indices.int()
+            indice_pairs[mirror_kid, 1, :n_found] = in_indices.int()
+            indice_pair_num[mirror_kid] = n_found
+
+    return indices, indice_pairs, indice_pair_num
+
+
+def _get_indice_pairs_conv_gpu(indices, batch_size, spatial_shape, ksize,
+                                stride, padding, dilation, out_padding,
+                                offsets, transposed, device):
+    """Regular/transposed conv: 2-stage approach.
+
+    Stage 1: for each input × offset → compute output coord, collect unique outputs.
+    Stage 2: build hash on unique outputs, lookup to fill indice_pairs[1].
+    """
+    ndim = len(spatial_shape)
+    kv = offsets.shape[0]
+    N = indices.shape[0]
+
+    if transposed:
+        out_spatial_shape = get_deconv_output_size(spatial_shape, ksize, stride,
+                                                    padding, dilation, out_padding)
+    else:
+        out_spatial_shape = get_conv_output_size(spatial_shape, ksize, stride,
+                                                  padding, dilation)
+
+    padding_t = torch.tensor(padding, device=device)
+    stride_t = torch.tensor(stride, device=device)
+    dilation_t = torch.tensor(dilation, device=device)
+    out_spatial_t = torch.tensor(out_spatial_shape, device=device)
+
+    in_spatial = indices[:, 1:]  # [N, ndim]
+    batch_ids = indices[:, 0]  # [N]
+
+    all_in_idx = []
+    all_out_keys = []
+    all_kid = []
+
+    for kid in range(kv):
+        offset = offsets[kid]  # [ndim]
+        if transposed:
+            out_sp = (in_spatial + padding_t - offset * dilation_t) * stride_t + offset * dilation_t
+        else:
+            out_sp = (in_spatial + padding_t - offset * dilation_t).div(
+                stride_t, rounding_mode='floor')
+            remainder = (in_spatial + padding_t - offset * dilation_t) % stride_t
+            stride_valid = (remainder == 0).all(dim=1)
+
+        valid = torch.ones(N, dtype=torch.bool, device=device)
+        if not transposed:
+            valid = valid & stride_valid
+        for d in range(ndim):
+            valid = valid & (out_sp[:, d] >= 0) & (out_sp[:, d] < out_spatial_t[d])
+
+        if not valid.any():
+            continue
+
+        valid_idx = valid.nonzero(as_tuple=True)[0]
+        out_coords = torch.cat([
+            batch_ids[valid_idx].unsqueeze(1),
+            out_sp[valid_idx]
+        ], dim=1).int()
+
+        out_keys = _coord_to_key(out_coords, out_spatial_shape, batch_size)
+
+        all_in_idx.append(valid_idx)
+        all_out_keys.append(out_keys)
+        all_kid.append(torch.full((valid_idx.shape[0],), kid,
+                                  dtype=torch.int32, device=device))
+
+    if len(all_in_idx) == 0:
+        out_inds = torch.zeros((0, ndim + 1), dtype=indices.dtype, device=device)
+        indice_pairs = torch.full((kv, 2, 1), -1, dtype=torch.int32, device=device)
+        indice_pair_num = torch.zeros(kv, dtype=torch.int32, device=device)
+        return out_inds, indice_pairs, indice_pair_num
+
+    cat_in_idx = torch.cat(all_in_idx)
+    cat_out_keys = torch.cat(all_out_keys)
+    cat_kid = torch.cat(all_kid)
+
+    # Stage 1.5: unique output coords
+    unique_out_keys, inverse = torch.unique(cat_out_keys, return_inverse=True)
+    num_out = unique_out_keys.shape[0]
+
+    # Decode unique keys back to coordinates
+    out_inds = torch.zeros((num_out, ndim + 1), dtype=indices.dtype, device=device)
+    vol_strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        vol_strides[d] = vol_strides[d + 1] * out_spatial_shape[d + 1]
+    vol = vol_strides[0] * out_spatial_shape[0]
+
+    remainder = unique_out_keys.clone()
+    out_inds[:, 0] = (remainder // vol).to(indices.dtype)
+    remainder = remainder % vol
+    for d in range(ndim):
+        out_inds[:, d + 1] = (remainder // vol_strides[d]).to(indices.dtype)
+        remainder = remainder % vol_strides[d]
+
+    # Stage 2: fill indice_pairs using inverse mapping for output indices
+    out_idx_mapped = inverse.int()  # maps each pair to unique output index
+    N_max = max(N, num_out)
+    indice_pairs = torch.full((kv, 2, N_max), -1, dtype=torch.int32, device=device)
+    indice_pair_num = torch.zeros(kv, dtype=torch.int32, device=device)
+
+    for kid in range(kv):
+        mask = cat_kid == kid
+        if not mask.any():
+            continue
+        kid_in_idx = cat_in_idx[mask].int()
+        kid_out_idx = out_idx_mapped[mask]
+        n_pairs = kid_in_idx.shape[0]
+        indice_pairs[kid, 0, :n_pairs] = kid_in_idx
+        indice_pairs[kid, 1, :n_pairs] = kid_out_idx
+        indice_pair_num[kid] = n_pairs
+
+    return out_inds, indice_pairs, indice_pair_num
+
+
+###############################################################################
+# Public API
+###############################################################################
+
 def get_indice_pairs(indices: torch.Tensor,
                      batch_size: int,
                      spatial_shape: List[int],
@@ -77,13 +361,22 @@ def get_indice_pairs(indices: torch.Tensor,
                      is_train: bool = True,
                      alloc=None,
                      timer=None):
-    """Compute indice pairs for sparse convolution (CPU implementation).
-    
+    """Compute indice pairs for sparse convolution.
+
+    Uses GPU-accelerated sort+searchsorted when on CUDA/ROCm device,
+    falls back to CPU dict implementation otherwise.
+
     Returns:
         out_inds: output indices [N_out, ndim+1]
         indice_pairs: [kv, 2, N_max] — gather/scatter index pairs
         indice_pair_num: [kv] — number of active pairs per kernel position
     """
+    if indices.is_cuda:
+        return _get_indice_pairs_gpu(
+            indices, batch_size, spatial_shape, ksize, stride,
+            padding, dilation, out_padding, subm, transposed)
+
+    # CPU fallback (original Python dict implementation)
     ndim = len(spatial_shape)
     kv = int(np.prod(ksize))
     device = indices.device
