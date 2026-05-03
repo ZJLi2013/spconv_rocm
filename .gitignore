@@ -108,7 +108,7 @@ venv.bak/
 
 .vscode
 
-__version__.py
+# __version__.py  # ROCm: tracked since no build-time generation
 
 wheelhouse_tmp
 
