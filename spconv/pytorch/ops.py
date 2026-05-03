@@ -252,7 +252,9 @@ def indice_conv(features: torch.Tensor,
         w = filters[i]  # [C_in, C_out]
         gemm_out = _gemm(inp_gathered, w)
 
-        # scatter-add to output
+        # scatter-add to output (cast if AMP autocast changed dtype)
+        if gemm_out.dtype != out_features.dtype:
+            gemm_out = gemm_out.to(out_features.dtype)
         out_features.index_add_(0, out_inds, gemm_out)
 
     return out_features
