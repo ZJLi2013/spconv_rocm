@@ -19,7 +19,8 @@ import torch
 from spconv.core import ConvAlgo
 from spconv.pytorch.constants import PYTORCH_VERSION
 from spconv.tools import CUDAKernelTimer
-from spconv.constants import SPCONV_FX_TRACE_MODE
+
+SPCONV_FX_TRACE_MODE = False
 
 if PYTORCH_VERSION >= [1, 8, 0]:
     try:
@@ -58,24 +59,15 @@ class ThrustSortAllocator:
 
 
 class IndiceData(object):
-    def __init__(self, out_indices, indices, indice_pairs, indice_pair_num,
-                 spatial_shape, out_spatial_shape, is_subm: bool, algo: ConvAlgo,
-                 ksize: List[int], stride: List[int], dilation: List[int], padding: List[int],
-                 voxel_num: Optional[Any] = None):
-        self.out_indices = out_indices
+    def __init__(self, indices, indice_pairs, indice_pair_num,
+                 spatial_shape, is_subm: bool, algo: ConvAlgo,
+                 **kwargs):
         self.indices = indices
         self.indice_pairs = indice_pairs
         self.indice_pair_num = indice_pair_num
         self.spatial_shape = spatial_shape
-        self.out_spatial_shape = out_spatial_shape
         self.is_subm = is_subm
         self.algo = algo
-        self.ksize = ksize
-        self.stride = stride
-        self.dilation = dilation
-        self.padding = padding
-        # voxel_num is only used in tensorrt conversion.
-        self.voxel_num = voxel_num
 
 
 class ImplicitGemmIndiceData(object):

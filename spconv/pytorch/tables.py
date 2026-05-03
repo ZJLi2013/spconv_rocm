@@ -19,9 +19,6 @@ from torch.autograd import Function
 from spconv.pytorch.modules import SparseModule
 from spconv.pytorch.core import SparseConvTensor
 from typing import List
-from spconv.pytorch import functional as F
-
-
 class JoinTable(SparseModule):
     def forward(self, input: List[SparseConvTensor]):
         msg = "you can't use JoinTable in two sptensor with different indices."
@@ -69,13 +66,10 @@ class AddTable(SparseModule):
 
 class AddTableMisaligned(SparseModule):
     """add sptensors with same shape but different indices.
-    slower than AddTable.
-    WARNING: you shouldn't use this in segmentation network such as U-Net
-    because add misaligned tensors will clear downsample indices and make 
-    SparseInverseConvXd not working.
+    Not supported in ROCm version — use AddTable instead.
     """
     def forward(self, input: List[SparseConvTensor]):
-        return F.sparse_add_hash_based(*input)
+        raise NotImplementedError("AddTableMisaligned not supported in spconv-rocm. Use AddTable.")
 
     def input_spatial_size(self, out_size):
         return out_size
