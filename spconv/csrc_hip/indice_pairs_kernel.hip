@@ -326,6 +326,11 @@ void generate_subm_conv_inds(
     hipLaunchKernelGGL(build_subm_hash_table_kernel<K>, dim3(blocks_build), dim3(threads), 0, stream,
                        table, indices_in, d_input_dims, ndim, num_act_in);
 
+    // Set center position count = N (identity mapping, all N entries valid).
+    int center = kv / 2;
+    hipMemcpyAsync(indice_num_per_loc + center, &num_act_in, sizeof(int),
+                   hipMemcpyHostToDevice, stream);
+
     // Compute indice pairs: 2D grid with blockIdx.y = filter_offset.
     // Only process half the kernel + center (kv/2 + 1 slices), mirror fills the rest.
     int blocks_x = (num_act_in + threads - 1) / threads;
