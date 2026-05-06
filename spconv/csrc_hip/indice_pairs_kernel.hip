@@ -131,14 +131,14 @@ __global__ void calc_subm_conv_indices_kernel(
                 if (slot != -1) {
                     int v = table.values[slot];
                     int old_num = atomicAdd(indice_num_per_loc + filter_offset, 1);
-                    // Forward: indice_pairs[0, filter_offset, old_num] = i (output)
-                    //          indice_pairs[1, filter_offset, old_num] = v (input)
-                    indice_pairs[filter_offset_mul_ips + old_num] = i;
-                    indice_pairs[ips_mul_kv + filter_offset_mul_ips + old_num] = v;
-                    // Mirror: indice_pairs[0, mirror, old_num] = v
-                    //         indice_pairs[1, mirror, old_num] = i
-                    indice_pairs[mirror_offset_mul_ips + old_num] = v;
-                    indice_pairs[ips_mul_kv + mirror_offset_mul_ips + old_num] = i;
+                    // indice_pairs[0] = input (gather source), [1] = output (scatter dest)
+                    // For filter_offset: i queries, v is the neighbor found
+                    //   → gather from v (input), scatter to i (output)
+                    indice_pairs[filter_offset_mul_ips + old_num] = v;
+                    indice_pairs[ips_mul_kv + filter_offset_mul_ips + old_num] = i;
+                    // Mirror: reversed — gather from i, scatter to v
+                    indice_pairs[mirror_offset_mul_ips + old_num] = i;
+                    indice_pairs[ips_mul_kv + mirror_offset_mul_ips + old_num] = v;
                 }
             }
         }
