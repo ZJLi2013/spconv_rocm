@@ -340,7 +340,16 @@ void generate_subm_conv_inds(
                        d_input_dims, d_ksize, d_dilation,
                        ndim, num_act_in, num_act_in, kv);
 
+    // Copy indice_num_per_loc from forward positions to their mirrors.
+    // Forward position k and mirror (kv-1-k) have the same pair count.
     hipStreamSynchronize(stream);
+    for (int k = 0; k < kv / 2; k++) {
+        int mirror = kv - 1 - k;
+        int count;
+        hipMemcpy(&count, indice_num_per_loc + k, sizeof(int), hipMemcpyDeviceToHost);
+        hipMemcpy(indice_num_per_loc + mirror, &count, sizeof(int), hipMemcpyHostToDevice);
+    }
+
     hipFree(hash_keys);
     hipFree(hash_vals);
     hipFree(d_input_dims);
