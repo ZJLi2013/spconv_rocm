@@ -475,6 +475,12 @@ def indice_conv(features: torch.Tensor,
     Returns:
         out_features: [N_out, C_out]
     """
+    hip = _get_hip_module()
+    if hip is not None and features.is_cuda:
+        return hip.indice_conv_forward(
+            features, filters, indice_pairs, indice_pair_num,
+            num_activate_out, subm)
+
     kv = filters.shape[0]
     c_in = features.shape[1]
     c_out = filters.shape[2]
@@ -521,6 +527,11 @@ def indice_conv_backward(features: torch.Tensor,
         din: gradient w.r.t. input features [N_in, C_in]
         dfilters: gradient w.r.t. filters [kv, C_in, C_out]
     """
+    hip = _get_hip_module()
+    if hip is not None and features.is_cuda:
+        return hip.indice_conv_backward(
+            features, filters, out_bp, indice_pairs, indice_pair_num, subm)
+
     kv = filters.shape[0]
     c_in = features.shape[1]
     c_out = filters.shape[2]
