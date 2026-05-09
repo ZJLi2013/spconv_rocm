@@ -72,6 +72,25 @@ def _gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.mm(a, b)
 
 
+_IMPLICIT_GEMM_AVAILABLE = None
+
+def _try_implicit_gemm(features, filters, indice_pairs, indice_pair_num, num_activate_out):
+    """Try cumm-rocm implicit GEMM (fused gather+GEMM+scatter). Returns None if unavailable."""
+    global _IMPLICIT_GEMM_AVAILABLE
+    if _IMPLICIT_GEMM_AVAILABLE is False:
+        return None
+    try:
+        from cumm.implicit_gemm import implicit_gemm_forward
+        _IMPLICIT_GEMM_AVAILABLE = True
+        return implicit_gemm_forward(features, filters, indice_pairs,
+                                     indice_pair_num, num_activate_out)
+    except ImportError:
+        _IMPLICIT_GEMM_AVAILABLE = False
+        return None
+    except Exception:
+        return None
+
+
 def get_conv_output_size(input_size, kernel_size, stride, padding, dilation):
     ndim = len(input_size)
     output_size = []
@@ -463,18 +482,24 @@ def indice_conv(features: torch.Tensor,
                 subm: bool = False,
                 algo: ConvAlgo = ConvAlgo.Native,
                 timer=None) -> torch.Tensor:
-    """Native path sparse convolution: gather → GEMM → scatter.
-    
+    """Sparse convolution dispatch: implicit GEMM → native gather+GEMM+scatter.
+
     Args:
         features: [N_in, C_in] input features
         filters: [kv, C_in, C_out] (KRSC layout with ALL_WEIGHT_IS_KRSC=True)
         indice_pairs: [kv, 2, N_max] gather/scatter indices
         indice_pair_num: [kv] active pair count per kernel position
         num_activate_out: number of output points
-    
+
     Returns:
         out_features: [N_out, C_out]
     """
+    if features.is_cuda:
+        out = _try_implicit_gemm(features, filters, indice_pairs,
+                                 indice_pair_num, num_activate_out)
+        if out is not None:
+            return out
+
     hip = _get_hip_module()
     if hip is not None and features.is_cuda:
         return hip.indice_conv_forward(
