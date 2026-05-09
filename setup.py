@@ -27,7 +27,7 @@ setup(
         "numpy",
     ],
     extras_require={
-        "flydsl": ["flydsl"],
+        "implicit-gemm": ["cumm-rocm"],
     },
     license="Apache-2.0",
     classifiers=[
