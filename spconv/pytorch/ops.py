@@ -494,7 +494,7 @@ def indice_conv(features: torch.Tensor,
     Returns:
         out_features: [N_out, C_out]
     """
-    if features.is_cuda:
+    if features.is_cuda and not features.requires_grad:
         out = _try_implicit_gemm(features, filters, indice_pairs,
                                  indice_pair_num, num_activate_out)
         if out is not None:
