@@ -75,6 +75,25 @@ class SparseConvolution(SparseModule):
         if self.bias is not None:
             self.bias.data.uniform_(-stdv, stdv)
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Accept checkpoints saved by CUDA spconv's ImplicitGemm path, whose conv weight
+        # is in KRSC layout: 5D [out, kd, kh, kw, in]. The ROCm Native path stores the
+        # weight as [kv, in, out] (or [in, out] when conv1x1, kv == 1). Convert on load so
+        # CUDA-trained checkpoints (TRELLIS, SAM-3D-Objects, ...) load unchanged on ROCm.
+        wkey = prefix + "weight"
+        w = state_dict.get(wkey, None)
+        if w is not None and w.dim() == 5 and self.weight.dim() in (2, 3):
+            out, kd, kh, kw, inc = w.shape
+            kv = kd * kh * kw
+            native = w.permute(1, 2, 3, 4, 0).contiguous().reshape(kv, inc, out)
+            if self.weight.dim() == 2 and kv == 1:
+                native = native.reshape(inc, out)
+            if native.shape == self.weight.shape:
+                state_dict[wkey] = native
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+
     def forward(self, input: SparseConvTensor) -> SparseConvTensor:
         assert input.features.shape[1] == self.in_channels
 
